@@ -1,7 +1,7 @@
 (() => {
 'use strict';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const CLASS_INFO = [
   ['WA','Warrior'],['BL','Blader'],['WI','Wizard'],['FA','Force Archer'],['FS','Force Shielder'],
   ['FB','Force Blader'],['GL','Gladiator'],['DM','Dark Mage'],['FG','Force Gunner']
@@ -228,16 +228,45 @@ function groupLines(tokens){
   const m=new Map(); for(const x of tokens){if(!m.has(x.lineKey))m.set(x.lineKey,[]);m.get(x.lineKey).push(x)}
   return [...m.values()].map(a=>a.sort((x,y)=>x.left-y.left));
 }
+// Tesseract often puts CABAL column headers into separate OCR blocks even
+// though they are visually on the same row. Re-cluster tokens by Y position
+// so "Ranking | Guild Name | Guild Master | Guild Score" is reconstructed.
+function groupVisualRows(tokens){
+  const src=[...tokens].sort((a,b)=>a.cy-b.cy||a.left-b.left), rows=[];
+  for(const tok of src){
+    let best=null,bestDist=Infinity;
+    for(let i=Math.max(0,rows.length-8);i<rows.length;i++){
+      const row=rows[i], cy=row.reduce((n,x)=>n+x.cy,0)/row.length;
+      const med=[...row.map(x=>x.height),tok.height].sort((a,b)=>a-b)[Math.floor((row.length+1)/2)]||tok.height||12;
+      const tol=Math.max(5,Math.min(26,med*.85));
+      const d=Math.abs(tok.cy-cy);
+      if(d<=tol&&d<bestDist){best=row;bestDist=d}
+    }
+    if(best)best.push(tok);else rows.push([tok]);
+  }
+  return rows.map(r=>r.sort((a,b)=>a.left-b.left));
+}
 function lineHas(line,term){return line.some(x=>x.low.includes(term))}
 function detectHeader(tokens,profileId){
-  const p=PROFILES[profileId], lines=groupLines(tokens), candidates=[];
+  const p=PROFILES[profileId], lines=[...groupVisualRows(tokens),...groupLines(tokens)], candidates=[];
   for(const line of lines){
-    if(!lineHas(line,'ranking'))continue;
+    const hasRank=lineHas(line,'ranking');
     if(profileId==='mission' && lineHas(line,'master'))continue;
-    const hit=p.required.reduce((n,r)=>n+(lineHas(line,r)?1:0),0);
-    const need=profileId==='mission'?3:p.required.length;
-    if(hit<need)continue;
-    const y=line.reduce((s,x)=>s+x.cy,0)/line.length;
+    let hit=p.required.reduce((n,r)=>n+(lineHas(line,r)?1:0),0);
+    // Guild Ranking is especially likely to lose the word "Ranking" when
+    // the popup is small inside a full-game screenshot. The three right-side
+    // headers are enough to identify it safely.
+    if(profileId==='guild'){
+      const guildHeader=(lineHas(line,'guild')?1:0)+(lineHas(line,'name')?1:0)+(lineHas(line,'master')?1:0)+(lineHas(line,'score')?1:0);
+      if(!hasRank && guildHeader<3)continue;
+      hit=Math.max(hit,guildHeader+(hasRank?1:0));
+      if(hit<3)continue;
+    }else{
+      if(!hasRank)continue;
+      const need=profileId==='mission'?3:Math.max(2,p.required.length-1);
+      if(hit<need)continue;
+    }
+    const y=line.reduce((n,x)=>n+x.cy,0)/line.length;
     const width=(Math.max(...line.map(x=>x.left+x.width))-Math.min(...line.map(x=>x.left)));
     candidates.push({score:hit*100+width*.001-y*.0001,line});
   }
@@ -250,7 +279,7 @@ function combinedAnchor(line,a,b){
   return y?{...x,cx:(x.cx+y.cx)/2,left:x.left,width:y.left+y.width-x.left}:{...x};
 }
 function anchorsFromHeader(line,profileId){
-  const rank=findToken(line,'ranking'); if(!rank)return null; const A={Ranking:rank};
+  let rank=findToken(line,'ranking'); const A={};
   if(profileId==='weekly'){
     A.Character=findToken(line,'character'); A['Treasure Score']=combinedAnchor(line,'treasure','score')||findToken(line,'score');
   }else if(profileId==='legend'){
@@ -269,6 +298,19 @@ function anchorsFromHeader(line,profileId){
   }else if(profileId==='contribution'){
     A['Character Name']=combinedAnchor(line,'character','name')||findToken(line,'character'); A.Score=findToken(line,'score'); A['Mission Count']=combinedAnchor(line,'mission','count')||findToken(line,'mission');
   }
+  // If OCR missed only the left "Ranking" header, infer its X position from
+  // the other detected columns. This is common on full-screen 2K screenshots.
+  if(!rank){
+    const known=Object.values(A).filter(Boolean).sort((a,b)=>a.cx-b.cx);
+    if(known.length>=2){
+      const gap=known[1].cx-known[0].cx;
+      const ratio=profileId==='guild'?.72:profileId==='mission'?.65:profileId==='contribution'?.68:profileId==='legend'?.52:.60;
+      const cx=Math.max(12,known[0].cx-gap*ratio);
+      rank={text:'Ranking',low:'ranking',cx,left:cx-24,width:48,height:fontHeight(line),top:Math.min(...line.map(x=>x.top)),cy:line.reduce((n,x)=>n+x.cy,0)/line.length};
+    }
+  }
+  if(!rank)return null;
+  A.Ranking=rank;
   return A;
 }
 function fontHeight(line){ const a=line.map(x=>x.height).filter(x=>x>=6&&x<=60); return a.length?a.sort((x,y)=>x-y)[Math.floor(a.length/2)]:18; }
@@ -301,6 +343,11 @@ function calcBounds(A,profileId,canvasW){
 function textIn(tokens,left,right){return tokens.filter(x=>x.cx>=left&&x.cx<right).sort((a,b)=>a.left-b.left).map(x=>x.text).join(' ').trim()}
 function cleanName(s){ return String(s||'').replace(/[|]/g,'I').replace(/\s+/g,'').replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9_-]+$/g,''); }
 function cleanGuild(s){ return String(s||'').replace(/\s+/g,' ').replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9_-]+$/g,'').trim(); }
+function cleanGuildScore(s){
+  const raw=String(s||'').split('(')[0];
+  const m=raw.match(/\d[\d,\.\s]*/);
+  return m?formatNumberText(m[0]):'';
+}
 function cleanMissionCount(s){ const m=String(s||'').replace(/\s/g,'').match(/(\d+)\D+(\d+)/); return m?`${m[1]}/${m[2]}`:''; }
 function cleanRecord(s){ return String(s||'').trim().replace(/\s+/g,' '); }
 function parseWorldMiddle(s){
@@ -373,7 +420,7 @@ async function analyzeImage(item,profileId,index,total){
     }else if(profileId==='achievement'){
       row.Level=digits(textIn(rr.tokens,...bounds.Level)).slice(0,3); row.Character=cleanName(textIn(rr.tokens,...bounds.Character)); row.Guild=cleanGuild(textIn(rr.tokens,...bounds.Guild)); row['Ach. Points']=formatNumberText(textIn(rr.tokens,...bounds['Ach. Points'])); row.Class=await classifyAchievementIcon(canvas,A,rr.cy,Math.max(rr.h,fh));
     }else if(profileId==='guild'){
-      row['Guild Name']=cleanGuild(textIn(rr.tokens,...bounds['Guild Name'])); row['Guild Master']=cleanName(textIn(rr.tokens,...bounds['Guild Master'])); row['Guild Score']=formatNumberText(textIn(rr.tokens,...bounds['Guild Score']));
+      row['Guild Name']=cleanGuild(textIn(rr.tokens,...bounds['Guild Name'])); row['Guild Master']=cleanName(textIn(rr.tokens,...bounds['Guild Master'])); row['Guild Score']=cleanGuildScore(textIn(rr.tokens,...bounds['Guild Score']));
     }else if(profileId==='mission'){
       row['Guild Name']=cleanGuild(textIn(rr.tokens,...bounds['Guild Name'])); row['Guild Point']=formatNumberText(textIn(rr.tokens,...bounds['Guild Point']));
     }else if(profileId==='contribution'){
@@ -381,7 +428,6 @@ async function analyzeImage(item,profileId,index,total){
     }
     const identity=row.Character||row['Character Name']||row['Guild Name']; if(identity && Object.values(row).filter(Boolean).length>=2)rows.push(row);
   }
-  if(profileId==='guild')rows.splice(10);
   const result={rows,meta,warnings:rows.length?[]:['No valid rows were parsed from this image.']}; item.cache={...(item.cache||{}),[profileId]:result};return result;
 }
 
