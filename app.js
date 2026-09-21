@@ -1,7 +1,7 @@
 (() => {
 'use strict';
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 const CLASS_INFO = [
   ['WA','Warrior'],['BL','Blader'],['WI','Wizard'],['FA','Force Archer'],['FS','Force Shielder'],
   ['FB','Force Blader'],['GL','Gladiator'],['DM','Dark Mage'],['FG','Force Gunner']
@@ -259,6 +259,32 @@ function parseTSV(tsv){
   }
   return out;
 }
+function parseBlocks(blocks){
+  const out=[];
+  if(!Array.isArray(blocks))return out;
+  blocks.forEach((block,bi)=>{
+    (block.paragraphs||[]).forEach((par,pi)=>{
+      (par.lines||[]).forEach((line,li)=>{
+        (line.words||[]).forEach((w,wi)=>{
+          const text=String(w.text||'').trim(); if(!text)return;
+          const b=w.bbox||{}; const left=Number(b.x0||0),top=Number(b.y0||0);
+          const right=Number(b.x1||left),bottom=Number(b.y1||top);
+          const width=Math.max(1,right-left),height=Math.max(1,bottom-top);
+          out.push({text,low:normalizeText(text),conf:Number(w.confidence??line.confidence??block.confidence??80),left,top,width,height,cx:left+width/2,cy:top+height/2,lineKey:'b'+bi+':p'+pi+':l'+li});
+        });
+      });
+    });
+  });
+  return out;
+}
+function tokensFromOCRData(data){
+  const a=parseBlocks(data&&data.blocks);
+  if(a.length)return a;
+  const b=parseTSV((data&&data.tsv)||'');
+  if(b.length)return b;
+  return [];
+}
+function ocrDebugText(data){return String((data&&data.text)||'').replace(/\s+/g,' ').trim().slice(0,700);}
 function groupLines(tokens){
   const m=new Map(); for(const x of tokens){if(!m.has(x.lineKey))m.set(x.lineKey,[]);m.get(x.lineKey).push(x)}
   return [...m.values()].map(a=>a.sort((x,y)=>x.left-y.left));
@@ -451,20 +477,22 @@ async function analyzeImage(item,profileId,index,total){
   let canvas=await imageFileToCanvas(item.file);
   if(profileId==='guild')canvas=autoCropDarkPanel(canvas);
   const worker=await ensureWorker();
-  await worker.setParameters({preserve_interword_spaces:'1',tessedit_pageseg_mode:profileId==='guild'?'6':'3'});
+  await worker.setParameters({preserve_interword_spaces:'1',tessedit_pageseg_mode:profileId==='guild'?'11':'3'});
   setProgress(5+index/Math.max(1,total)*90,`OCR ${index+1}/${total}: ${item.name}`);
-  const {data}=await worker.recognize(canvas,{}, {tsv:true}); const tokens=parseTSV(data.tsv||'');
+  const {data}=await worker.recognize(canvas,{}, {text:true,blocks:true,tsv:true});
+  const tokens=tokensFromOCRData(data);
+  const debugText=ocrDebugText(data);
   const header=detectHeader(tokens,profileId);
   if(!header){
     const warning=profileId==='mission' && tokens.some(x=>x.low.includes('contribution')) ? 'This image looks like GMF Contribution Ranking. Use that tab.' : 'Table header was not detected.';
-    return {rows:[],warnings:[warning],meta:{}};
+    return {rows:[],warnings:[warning + (debugText ? ' OCR read: "'+debugText+'"' : ' OCR returned no text.')],meta:{}};
   }
-  const A=anchorsFromHeader(header,profileId); if(!A)return{rows:[],warnings:['Header anchors are incomplete.'],meta:{}};
-  const bounds=calcBounds(A,profileId,canvas.width); if(!bounds)return{rows:[],warnings:['Column layout was not detected.'],meta:{}};
+  const A=anchorsFromHeader(header,profileId); if(!A)return{rows:[],warnings:['Header anchors are incomplete.'+(debugText?' OCR read: "'+debugText+'"':'')],meta:{}};
+  const bounds=calcBounds(A,profileId,canvas.width); if(!bounds)return{rows:[],warnings:['Column layout was not detected.'+(debugText?' OCR read: "'+debugText+'"':'')],meta:{}};
   const fh=fontHeight(header), headerBottom=Math.max(...header.map(x=>x.top+x.height)), maxY=Math.min(canvas.height,headerBottom+Math.max(240,fh*PROFILES[profileId].bodyFactor));
   if(profileId==='guild'){
     const guildRows=parseGuildVisualRows(tokens,bounds,headerBottom,maxY,fh);
-    const result={rows:guildRows,meta:{},warnings:guildRows.length?[]:['Guild Ranking table was found, but no valid guild rows were parsed.']};
+    const result={rows:guildRows,meta:{},warnings:guildRows.length?[]:['Guild Ranking table was found, but no valid guild rows were parsed.'+(debugText?' OCR read: "'+debugText+'"':'')]};
     item.cache={...(item.cache||{}),[profileId]:result};return result;
   }
   const rankX=A.Ranking.cx, rankTol=Math.max(32,fh*3.0);
@@ -497,7 +525,7 @@ async function analyzeImage(item,profileId,index,total){
     }
     const identity=row.Character||row['Character Name']||row['Guild Name']; if(identity && Object.values(row).filter(Boolean).length>=2)rows.push(row);
   }
-  const result={rows,meta,warnings:rows.length?[]:['No valid rows were parsed from this image.']}; item.cache={...(item.cache||{}),[profileId]:result};return result;
+  const result={rows,meta,warnings:rows.length?[]:['No valid rows were parsed from this image.'+(debugText?' OCR read: "'+debugText+'"':' OCR returned no text.')]}; item.cache={...(item.cache||{}),[profileId]:result};return result;
 }
 
 function rowScore(row,profileId){
