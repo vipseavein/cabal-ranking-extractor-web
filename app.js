@@ -1,7 +1,7 @@
 (() => {
 'use strict';
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 const CLASS_INFO = [
   ['WA','Warrior'],['BL','Blader'],['WI','Wizard'],['FA','Force Archer'],['FS','Force Shielder'],
   ['FB','Force Blader'],['GL','Gladiator'],['DM','Dark Mage'],['FG','Force Gunner']
@@ -200,6 +200,41 @@ async function imageFileToCanvas(file){
   const c=document.createElement('canvas'); c.width=w;c.height=h; const ctx=c.getContext('2d',{willReadFrequently:true});
   ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';ctx.drawImage(bmp,0,0,w,h);bmp.close(); return c;
 }
+// Guild Ranking can be a small popup inside a 2K gameplay screenshot.
+// Find the darkest central rectangular panel with a lightweight integral-image
+// scan, expand around it, then OCR the popup instead of the whole game scene.
+function autoCropDarkPanel(src){
+  if(src.width<1150 && src.height<1050)return src;
+  const dw=280, dh=Math.max(120,Math.round(src.height/src.width*dw));
+  const sm=document.createElement('canvas');sm.width=dw;sm.height=dh;
+  const sx=sm.getContext('2d',{willReadFrequently:true});sx.drawImage(src,0,0,dw,dh);
+  const d=sx.getImageData(0,0,dw,dh).data, mask=new Uint8Array(dw*dh);
+  for(let i=0,j=0;i<d.length;i+=4,j++){const g=.299*d[i]+.587*d[i+1]+.114*d[i+2];mask[j]=g<82?1:0}
+  const iw=dw+1, integral=new Uint32Array((dw+1)*(dh+1));
+  for(let y=1;y<=dh;y++){let row=0;for(let x=1;x<=dw;x++){row+=mask[(y-1)*dw+x-1];integral[y*iw+x]=integral[(y-1)*iw+x]+row}}
+  const sum=(x0,y0,x1,y1)=>integral[y1*iw+x1]-integral[y0*iw+x1]-integral[y1*iw+x0]+integral[y0*iw+x0];
+  let best=null;
+  const wfs=[.32,.36,.40,.44,.48], hfs=[.22,.26,.30,.34,.38];
+  for(const wf of wfs)for(const hf of hfs){
+    const rw=Math.round(dw*wf),rh=Math.round(dh*hf),step=Math.max(4,Math.round(Math.min(rw,rh)/14));
+    for(let y=Math.round(dh*.14);y+rh<dh*.78;y+=step)for(let x=Math.round(dw*.16);x+rw<dw*.84;x+=step){
+      const density=sum(x,y,x+rw,y+rh)/(rw*rh),cx=x+rw/2,cy=y+rh/2;
+      const centerPenalty=Math.abs(cx-dw/2)/dw*.10+Math.abs(cy-dh*.48)/dh*.04;
+      const score=density-centerPenalty;
+      if(!best||score>best.score)best={score,density,x,y,rw,rh};
+    }
+  }
+  if(!best||best.density<.67)return src;
+  const fx=src.width/dw,fy=src.height/dh;
+  let x=(best.x-best.rw*.22)*fx,y=(best.y-best.rh*.28)*fy,w=best.rw*1.44*fx,h=best.rh*1.58*fy;
+  x=Math.max(0,x);y=Math.max(0,y);w=Math.min(src.width-x,w);h=Math.min(src.height-y,h);
+  const targetW=Math.max(1050,Math.min(1500,Math.round(w)));
+  const scale=targetW/w,targetH=Math.max(1,Math.round(h*scale));
+  const out=document.createElement('canvas');out.width=targetW;out.height=targetH;
+  const ctx=out.getContext('2d',{willReadFrequently:true});ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+  ctx.drawImage(src,x,y,w,h,0,0,targetW,targetH);
+  return out;
+}
 
 async function ensureWorker(){
   if(state.worker)return state.worker;
@@ -348,6 +383,32 @@ function cleanGuildScore(s){
   const m=raw.match(/\d[\d,\.\s]*/);
   return m?formatNumberText(m[0]):'';
 }
+function parseGuildVisualRows(tokens,bounds,headerBottom,maxY,fh){
+  const lines=groupVisualRows(tokens), raw=[];
+  for(const line of lines){
+    if(!line.length)continue;
+    const cy=line.reduce((n,x)=>n+x.cy,0)/line.length;
+    if(cy<=headerBottom+Math.max(3,fh*.25)||cy>=maxY)continue;
+    const guild=cleanGuild(textIn(line,...bounds['Guild Name']));
+    const master=cleanName(textIn(line,...bounds['Guild Master']));
+    const score=cleanGuildScore(textIn(line,...bounds['Guild Score']));
+    const scoreNum=Number(digits(score)||0);
+    if(!guild||guild.length<2||!master||master.length<2||scoreNum<1000)continue;
+    const low=normalizeText(guild);
+    if(low.includes('guild')||low.includes('eventgoal')||low.includes('ranking'))continue;
+    raw.push({cy,'Guild Name':guild,'Guild Master':master,'Guild Score':score});
+  }
+  raw.sort((a,b)=>a.cy-b.cy);
+  const uniq=[],seen=new Set();
+  for(const r of raw){
+    const key=normalizeText(r['Guild Name'])+'|'+digits(r['Guild Score']);
+    if(seen.has(key))continue;
+    seen.add(key);uniq.push(r);
+  }
+  return uniq.slice(0,10).map((r,i)=>({
+    Ranking:String(i+1),'Guild Name':r['Guild Name'],'Guild Master':r['Guild Master'],'Guild Score':r['Guild Score']
+  }));
+}
 function cleanMissionCount(s){ const m=String(s||'').replace(/\s/g,'').match(/(\d+)\D+(\d+)/); return m?`${m[1]}/${m[2]}`:''; }
 function cleanRecord(s){ return String(s||'').trim().replace(/\s+/g,' '); }
 function parseWorldMiddle(s){
@@ -387,7 +448,10 @@ async function classifyAchievementIcon(canvas,A,rowCy,rowH){
 
 async function analyzeImage(item,profileId,index,total){
   if(item.cache?.[profileId])return item.cache[profileId];
-  const canvas=await imageFileToCanvas(item.file),worker=await ensureWorker();
+  let canvas=await imageFileToCanvas(item.file);
+  if(profileId==='guild')canvas=autoCropDarkPanel(canvas);
+  const worker=await ensureWorker();
+  await worker.setParameters({preserve_interword_spaces:'1',tessedit_pageseg_mode:profileId==='guild'?'6':'3'});
   setProgress(5+index/Math.max(1,total)*90,`OCR ${index+1}/${total}: ${item.name}`);
   const {data}=await worker.recognize(canvas,{}, {tsv:true}); const tokens=parseTSV(data.tsv||'');
   const header=detectHeader(tokens,profileId);
@@ -398,6 +462,11 @@ async function analyzeImage(item,profileId,index,total){
   const A=anchorsFromHeader(header,profileId); if(!A)return{rows:[],warnings:['Header anchors are incomplete.'],meta:{}};
   const bounds=calcBounds(A,profileId,canvas.width); if(!bounds)return{rows:[],warnings:['Column layout was not detected.'],meta:{}};
   const fh=fontHeight(header), headerBottom=Math.max(...header.map(x=>x.top+x.height)), maxY=Math.min(canvas.height,headerBottom+Math.max(240,fh*PROFILES[profileId].bodyFactor));
+  if(profileId==='guild'){
+    const guildRows=parseGuildVisualRows(tokens,bounds,headerBottom,maxY,fh);
+    const result={rows:guildRows,meta:{},warnings:guildRows.length?[]:['Guild Ranking table was found, but no valid guild rows were parsed.']};
+    item.cache={...(item.cache||{}),[profileId]:result};return result;
+  }
   const rankX=A.Ranking.cx, rankTol=Math.max(32,fh*3.0);
   const rankTokens=tokens.filter(x=>x.cy>headerBottom+2&&x.cy<maxY&&x.cx>rankX-rankTol&&x.cx<rankX+rankTol&&/\d/.test(x.text));
   const candidates=[];
