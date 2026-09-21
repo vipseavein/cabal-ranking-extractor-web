@@ -1,0 +1,8 @@
+{
+  "name":"CABAL Ranking Extractor Web",
+  "short_name":"CABAL Extractor",
+  "start_url":"./",
+  "display":"standalone",
+  "background_color":"#07111d",
+  "theme_color":"#07111d"
+}
